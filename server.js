@@ -1,97 +1,111 @@
-const express = require("express");
-const crypto = require("crypto");
+// server.js
+// Minimal Shopify webhook -> add "wholesale" tag to new customers
 
+const crypto = require('crypto');
+const express = require('express');
+
+const app = express();
 const PORT = process.env.PORT || 10000;
 
-// From Render env
-const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;         // shpss_...
-const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;       // shpat_...
-const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;     // cervantes-coffee.myshopify.com
+/* ========= ENV VARS (Render) =========
+  SHOPIFY_API_KEY        (not used here, fine if present)
+  SHOPIFY_API_SECRET     shpss_...
+  SHOPIFY_ADMIN_TOKEN    shpat_...
+  SHOPIFY_STORE_DOMAIN   cervantes-coffee.myshopify.com
+====================================== */
 
-// --- helpers ---
-function verifyHmac(hmacHeader, rawBody) {
-  const digest = crypto
-    .createHmac("sha256", SHOPIFY_API_SECRET || "")
-    .update(rawBody, "utf8")
-    .digest("base64");
-  if (!hmacHeader) return false;
-  try {
-    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
-  } catch {
-    return false;
-  }
-}
+const {
+  SHOPIFY_API_SECRET,
+  SHOPIFY_ADMIN_TOKEN,
+  SHOPIFY_STORE_DOMAIN,
+} = process.env;
 
-async function addTag(customerId, tag) {
-  const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2025-01/customers/${customerId}/tags.json`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
-      "Content-Type": "application/json",
-      "Accept": "application/json"
+// Use a stable Admin API version (don't point at “latest” or a future version)
+const ADMIN_API_VERSION = '2024-10';
+
+// Capture raw body for HMAC verification, while still parsing JSON for use
+app.use(
+  express.json({
+    type: '*/*',
+    verify: (req, _res, buf) => {
+      req.rawBody = buf; // keep the exact payload bytes
     },
-    body: JSON.stringify({ tags: tag })
-  });
-
-  const text = await res.text();
-  console.log("Tag API:", res.status, text);
-  if (!res.ok) throw new Error(`Tag API failed: ${res.status}`);
-}
-
-// --- app ---
-const app = express();
-
-// Health check
-app.get("/", (_req, res) => res.status(200).send("OK"));
-
-// Webhook endpoint
-app.post(
-  "/webhook",
-  // raw body is REQUIRED for HMAC verification
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    console.log("Webhook hit", new Date().toISOString());
-    const hmac = req.get("X-Shopify-Hmac-Sha256");
-    const topic = req.get("X-Shopify-Topic");
-    const shop = req.get("X-Shopify-Shop-Domain");
-    const raw = req.body.toString("utf8");
-
-    if (!verifyHmac(hmac, raw)) {
-      console.log("HMAC verification FAILED");
-      return res.status(401).send("bad hmac");
-    }
-
-    let payload;
-    try {
-      payload = JSON.parse(raw);
-    } catch (e) {
-      console.error("JSON parse error:", e);
-      return res.status(400).send("bad json");
-    }
-
-    console.log("Verified webhook:", topic, "from", shop);
-
-    // Always respond fast so Shopify stops retrying
-    res.status(200).send("ok");
-
-    // Do work after acknowledging to Shopify
-    if (topic === "customers/create") {
-      try {
-        const id = payload.customer?.id || payload.id;
-        await addTag(id, "wholesale"); // <-- tag you want to add
-        console.log("Tag added for customer", id);
-      } catch (e) {
-        console.error("Tag add error:", e);
-      }
-    }
-  }
+  })
 );
 
-// Error handler
-app.use((err, _req, res, _next) => {
-  console.error("Unhandled error:", err);
-  res.status(500).send("error");
+// Health check
+app.get('/health', (_req, res) => res.status(200).send('OK'));
+
+// Webhook endpoint
+app.post('/webhook', async (req, res) => {
+  try {
+    // 1) Verify HMAC
+    const hmacHeader = req.get('X-Shopify-Hmac-Sha256') || '';
+    const digest = crypto
+      .createHmac('sha256', SHOPIFY_API_SECRET)
+      .update(req.rawBody) // MUST be the raw bytes
+      .digest('base64');
+
+    if (!timingSafeEqual(digest, hmacHeader)) {
+      console.error('HMAC verification FAILED');
+      return res.sendStatus(401);
+    }
+
+    console.log('Verified webhook');
+
+    // 2) Only handle customers/create
+    const topic = req.get('X-Shopify-Topic');
+    if (topic !== 'customers/create') {
+      console.log('Ignoring topic:', topic);
+      return res.sendStatus(200);
+    }
+
+    const customerId = req.body?.id;
+    if (!customerId) {
+      console.error('No customer id in payload');
+      return res.sendStatus(400);
+    }
+
+    // 3) Add the "wholesale" tag
+    await addTag(customerId, 'wholesale');
+    console.log(`Tag added for customer ${customerId}`);
+
+    return res.sendStatus(200);
+  } catch (err) {
+    console.error('Webhook handler error:', err);
+    return res.sendStatus(500);
+  }
 });
 
-app.listen(PORT, () => console.log(`Listening on ${PORT}`));
+// Helper: constant-time compare
+function timingSafeEqual(a, b) {
+  const aBuf = Buffer.from(a);
+  const bBuf = Buffer.from(b);
+  if (aBuf.length !== bBuf.length) return false;
+  return crypto.timingSafeEqual(aBuf, bBuf);
+}
+
+// Helper: add one tag without overwriting others
+async function addTag(customerId, tag) {
+  const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${ADMIN_API_VERSION}/customers/${customerId}/tags.json`;
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN,
+    },
+    body: JSON.stringify({ tags: tag }), // correct payload shape
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    console.error('Tag API error', res.status, text);
+    throw new Error(`Tag API failed: ${res.status}`);
+  }
+}
+
+app.listen(PORT, () => {
+  console.log(`Listening on ${PORT}`);
+  console.log('Your service is live 🎉');
+});
